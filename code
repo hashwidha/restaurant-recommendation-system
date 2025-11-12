@@ -1,0 +1,139 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, r2_score
+import warnings
+warnings.filterwarnings('ignore')
+import re
+import string
+import nltk
+from nltk.corpus import stopwords
+from sklearn.metrics.pairwise import linear_kernel
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.preprocessing import MinMaxScaler
+
+# Ensure NLTK stopwords are available
+try:
+    _ = stopwords.words('english')
+except LookupError:
+    nltk.download('stopwords')
+
+# Load the dataset
+zomato_real = pd.read_csv(r"C:\Users\alaga\OneDrive\Desktop\zomato.csv")
+zomato = zomato_real.drop(['url', 'dish_liked', 'phone'], axis=1)
+
+# Remove duplicates and null values
+zomato.drop_duplicates(inplace=True)
+zomato.dropna(how='any', inplace=True)
+
+# (Optional stray comment removed)
+# Rename columns
+zomato = zomato.rename(columns={
+    'approx_cost(for two people)': 'cost',
+    'listed_in(type)': 'type',
+    'listed_in(city)': 'city'
+})
+
+# Transform 'cost' column to float
+zomato['cost'] = zomato['cost'].astype(str).apply(lambda x: x.replace(',', '')).astype(float)
+
+# Filter out invalid ratings and clean the 'rate' column
+zomato = zomato[zomato.rate != 'NEW']
+zomato = zomato[zomato.rate != '-']
+zomato = zomato.reset_index(drop=True)
+zomato['rate'] = zomato['rate'].apply(lambda x: x.replace('/5', '') if isinstance(x, str) else x).astype(float)
+
+# Title-case restaurant names and convert Yes/No to Boolean
+zomato['name'] = zomato['name'].apply(lambda x: x.title())
+zomato['online_order'].replace({'Yes': True, 'No': False}, inplace=True)
+zomato['book_table'].replace({'Yes': True, 'No': False}, inplace=True)
+
+# Calculate mean rating per restaurant
+zomato['Mean Rating'] = zomato.groupby('name')['rate'].transform('mean')
+
+# Normalize mean rating to a 1–5 scale
+scaler = MinMaxScaler(feature_range=(1, 5))
+zomato[['Mean Rating']] = scaler.fit_transform(zomato[['Mean Rating']]).round(2)
+
+# Preprocess 'reviews_list' safely (handle missing values)
+zomato['reviews_list'] = zomato['reviews_list'].astype(str).str.lower()
+
+# Remove punctuation
+def remove_punctuation(text):
+    if pd.isna(text):
+        return ""
+    return text.translate(str.maketrans('', '', string.punctuation))
+
+zomato['reviews_list'] = zomato['reviews_list'].apply(remove_punctuation)
+
+# Remove stopwords
+stop_words = set(stopwords.words('english'))
+def remove_stopwords(text):
+    if pd.isna(text) or text == "":
+        return ""
+    return " ".join([word for word in text.split() if word not in stop_words])
+
+zomato['reviews_list'] = zomato['reviews_list'].apply(remove_stopwords)
+
+# Remove URLs
+def remove_urls(text):
+    if pd.isna(text):
+        return ""
+    return re.sub(r'https?://\S+|www\.\S+', '', text)
+
+zomato['reviews_list'] = zomato['reviews_list'].apply(remove_urls)
+
+# Drop unnecessary columns (if they exist)
+cols_to_drop = ['address', 'rest_type', 'type', 'menu_item', 'votes']
+existing_drop = [c for c in cols_to_drop if c in zomato.columns]
+if existing_drop:
+    zomato.drop(existing_drop, axis=1, inplace=True)
+
+# Sample 50% of the data
+df_percent = zomato.sample(frac=0.5, random_state=42).copy()
+df_percent.set_index('name', inplace=True)
+
+# Create indices Series mapping
+indices = pd.Series(df_percent.index)
+
+# TF-IDF vectorization (min_df set to 1)
+tfidf = TfidfVectorizer(analyzer='word', ngram_range=(1, 2), min_df=1, stop_words='english')
+# Ensure reviews_list exists and isn't empty for vectorizer
+if 'reviews_list' not in df_percent.columns or df_percent['reviews_list'].isnull().all():
+    raise ValueError("reviews_list column is missing or empty in the sampled dataframe.")
+tfidf_matrix = tfidf.fit_transform(df_percent['reviews_list'].fillna(""))
+
+# Compute cosine similarity
+cosine_similarities = linear_kernel(tfidf_matrix, tfidf_matrix)
+
+# Recommendation function
+def recommend(name, cosine_similarities=cosine_similarities):
+    if name not in indices.values:
+        print(f"'{name}' not found in dataset.")
+        return pd.DataFrame()
+
+    # find the integer index corresponding to this restaurant name
+    idx = indices[indices == name].index[0]
+
+    score_series = pd.Series(cosine_similarities[idx]).sort_values(ascending=False)
+    top30_indexes = list(score_series.iloc[1:31].index)  # skip self-match at index 0
+
+    recommend_restaurant = [indices[i] for i in top30_indexes]
+
+    df_new = pd.DataFrame(columns=['cuisines', 'Mean Rating', 'cost'])
+    for rest in recommend_restaurant:
+        sample = df_percent.loc[df_percent.index == rest, ['cuisines', 'Mean Rating', 'cost']]
+        if not sample.empty:
+            # pick one row (if multiple), otherwise skip
+            df_new = pd.concat([df_new, sample.sample(n=1)], axis=0)
+
+    df_new = df_new.sort_values(by='Mean Rating', ascending=False).head(10).reset_index()
+    print(f'TOP {len(df_new)} RESTAURANTS LIKE "{name}" BASED ON REVIEWS:')
+    return df_new
+
+# Example usage
+if __name__ == "__main__":
+    print(recommend('Pai Vihar'))
